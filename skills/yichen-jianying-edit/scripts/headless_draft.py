@@ -47,6 +47,10 @@ PINS = {
     'native_export.cpp': 'c60da6c65f5bb7ac733b8f5b619401be3921f9254b953a55903d4e7566156379',
     'headless_runtime.py': '81d75135473eb531688099b45a5a2acf922b4c385a8feaf39f0c92963b46ccca',
     'blueprint.json': '91f7eddad5bff9af23eb88b53713c180e3e3d4054edd469140cfa9aa56bc1dc9',
+    'windows_portable.py': '707e5f1040ad59384f864e5e2ad41ff2c93853be8c7bd562d44f6fb632d244ca',
+    'windows_export.py': 'a8a6d9e2ed89f9a176227c434570ba73735d29049dfc7fdb95da5c049cc7a769',
+    'ffmpeg_graph.py': 'a2e37c5f2f2ba39ebda5d4f8ab1f4fa31a395a390492fc587c114181deedea23',
+    'ffmpeg_tools.py': 'c8d0817c57573e0e755f3277466fa13e08bdc588d90471344faaf30438e9992f',
 }
 
 for name, expected in PINS.items():
@@ -56,10 +60,28 @@ for name, expected in PINS.items():
 
 sys.path.insert(0, str(BACKEND))
 entrypoint = 'jy14_headless.py'
-if len(sys.argv) > 1 and sys.argv[1] == 'edit':
+command = sys.argv[1] if len(sys.argv) > 1 else None
+if command == 'edit':
+    if os.name == 'nt':
+        raise SystemExit('Native Jianying draft editing is macOS-only')
     entrypoint = 'native_edit.py'
     del sys.argv[1]
-elif len(sys.argv) > 1 and sys.argv[1] == 'export':
-    entrypoint = 'native_export.py'
+elif command == 'export':
+    requested = None
+    if '--backend' in sys.argv:
+        index = sys.argv.index('--backend')
+        if index + 1 >= len(sys.argv):
+            raise SystemExit('--backend needs a value')
+        requested = sys.argv[index + 1]
+        del sys.argv[index:index + 2]
+    if requested not in {None, 'native', 'windows-ffmpeg'}:
+        raise SystemExit('Unsupported export backend: ' + requested)
+    entrypoint = ('windows_export.py'
+                  if requested == 'windows-ffmpeg' or (requested is None and os.name == 'nt')
+                  else 'native_export.py')
     del sys.argv[1]
+elif os.name == 'nt':
+    if command not in {None, '--help', '-h', 'doctor', 'build', 'verify-build'}:
+        raise SystemExit('This command requires the macOS native backend: ' + str(command))
+    entrypoint = 'windows_portable.py'
 runpy.run_path(str(BACKEND / entrypoint), run_name='__main__')
