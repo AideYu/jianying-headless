@@ -10,6 +10,7 @@ import json
 import math
 import os
 from pathlib import Path
+import platform
 import re
 import shutil
 import time
@@ -623,6 +624,55 @@ def normalize_saved_provenance(before, after, runtime):
     return changed
 
 
+def compare_saved_timeline(expected, actual, runtime_profile, *, frame_tolerance=0, quantized=None):
+    """Compare native save output with explicit, validated timeline context.
+
+    Only 11.5 interprets absent fps/speed as native defaults. Walk real compound
+    timelines in comparison copies; similarly named plugin data stays strict.
+    Normalize both sides so an omitted expected default cannot hide a new value.
+    Other callers of preserved() retain the existing upstream rules.
+    """
+    j.require(runtime_profile is not None, 'Saved timeline comparison requires an explicit runtime profile')
+
+    def comparison_copy(value):
+        value = deepcopy(value)
+        rows = compound.validate(value, basic_validation)
+        for _, timeline in rows:
+            validate_timeline_schema(timeline, runtime_profile)
+        if runtime_profile != 'jy14-headless-macos-11.5.0':
+            return value
+
+        def default(node, key, number):
+            # setdefault alone is insufficient: bool == 1 in Python, and the
+            # generic comparator intentionally retains its existing semantics.
+            if key not in node:
+                node[key] = number
+            else:
+                j.require(type(node[key]) in (int, float) and math.isfinite(node[key]) and node[key] > 0,
+                          'Invalid native saved ' + key)
+
+        for _, timeline in rows:
+            default(timeline, 'fps', 30)
+            index = material_index(timeline)
+            for node in timeline.get('materials', {}).get('speeds', []):
+                if node.get('type') == 'speed':
+                    default(node, 'speed', 1)
+            for track in timeline.get('tracks', []):
+                bucket = {'video': 'videos', 'audio': 'audios'}.get(track.get('type'))
+                if bucket is None:
+                    continue
+                for segment in track.get('segments', []):
+                    # These are the two speed-bearing track kinds supported by
+                    # set_segment(); text/effect/unknown material owners do not
+                    # acquire a new speed default from their JSON key names.
+                    if index[segment['material_id']][0] == bucket:
+                        default(segment, 'speed', 1)
+        return value
+
+    preserved(comparison_copy(expected), comparison_copy(actual),
+              frame_tolerance=frame_tolerance, quantized=quantized)
+
+
 def verify_live(out):
     out = Path(out).resolve(strict=True)
     record = j.read_json(out / 'build.json')
@@ -660,6 +710,19 @@ def verify_live(out):
                 change['last_modified_app_before'] = old_platform['app_version']
                 change['last_modified_app_after'] = after['last_modified_platform']['app_version']
                 after['last_modified_platform']['app_version'] = old_platform['app_version']
+            new_platform = after['last_modified_platform']
+            if 'os_version' in old_platform and old_platform['os_version'] != new_platform.get('os_version'):
+                old_os, new_os = old_platform['os_version'], new_platform.get('os_version')
+                current_os = platform.mac_ver()[0]
+                j.require(old_platform.get('os') == new_platform.get('os') == 'mac' and
+                          all(isinstance(value, str) and re.fullmatch(r'[0-9]+(?:\.[0-9]+){1,2}', value)
+                              for value in (old_os, new_os, current_os)) and new_os == current_os,
+                          'Unreviewed native save OS provenance change')
+                # Only the reviewed 185 -> 187 save migration can restamp the
+                # last-save OS to this host. Source platform remains strict.
+                new_platform['os_version'] = old_os
+                change['last_modified_os_version_before'] = old_os
+                change['last_modified_os_version_after'] = new_os
             # Native save stamps current-machine provenance. These identifiers
             # are not editing content; keep source platform and every other
             # nonempty field strict, and report names without leaking values.
@@ -674,8 +737,8 @@ def verify_live(out):
             change['restamped_device_field_names'] = changed_device_fields
     quantized = []
     normalize = compound.normalize_paths if font_assets is None else fonts.normalize_paths
-    preserved(normalize(expected, target), normalize(compared, target),
-              frame_tolerance=math.ceil(1_000_000 / expected.get('fps', 30)), quantized=quantized)
+    compare_saved_timeline(normalize(expected, target), normalize(compared, target),
+                           runtime, frame_tolerance=math.ceil(1_000_000 / expected.get('fps', 30)), quantized=quantized)
     checked_fonts = fonts.verify_assets(font_assets, actual, target, target) if font_assets is not None else 0
     compound.check_order(expected, actual)
     checked_compounds = compound.check_sidecars(actual, target, target, preserved)
