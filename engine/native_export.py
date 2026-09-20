@@ -22,7 +22,7 @@ import native_fonts as fonts
 import native_motion as motion
 import native_resources as resources
 import native_compound as compound
-from runtime_profiles import EXPORT_PROFILES, validate_export_profiles
+from runtime_profiles import EXPORT_PROFILES, validate_export_profiles, validate_timeline_schema
 
 HERE = Path(__file__).resolve().parent
 SCHEMA = 'jy14-native-export/v1'
@@ -241,11 +241,90 @@ def source_in_build(raw, target, folder):
     return source, relative
 
 
+def complete_position_keyframes(timeline, runtime_profile):
+    """Add the observed 11.5 static-Y workaround once in the render copy.
+
+    Existing channels and their IDs remain exact. Point offsets are segment-local;
+    the constant curve does not change an imported X curve or its time mapping.
+    The returned changes are reused by every compound representation.
+    """
+    changes = {}
+    if runtime_profile != 'jy14-headless-macos-11.5.0':
+        return changes
+    for child, track, segment in compound.all_segments(timeline):
+        if track.get('type') not in {'video', 'text'}:
+            continue
+        groups = segment.get('common_keyframes', [])
+        properties = {group.get('property_type') for group in groups}
+        y = segment.get('clip', {}).get('transform', {}).get('y', 0)
+        if 'KFTypePositionX' not in properties or 'KFTypePositionY' in properties or y == 0:
+            continue
+        j.require(type(y) in (int, float) and math.isfinite(y), 'Invalid static Y for position completion')
+        duration = j.integer(segment['target_timerange']['duration'], 'Position keyframe duration', 1)
+        before = deepcopy(groups)
+        added = motion.keyframe_groups({'keyframes': {'y': [
+            {'at_us': 0, 'value': y}, {'at_us': duration, 'value': y}]}})
+        segment['common_keyframes'] = groups + added
+        changes[(child['id'], track['id'], segment['id'])] = (before, segment['common_keyframes'])
+    return changes
+
+
+def sync_position_keyframes(saved, changes):
+    """Update only affected curves, retaining sidecar-only fields and identities."""
+    for child, track, segment in compound.all_segments(saved):
+        key = (child['id'], track['id'], segment['id'])
+        if key in changes:
+            before, after = changes[key]
+            j.require(segment.get('common_keyframes', []) == before,
+                      'Compound sidecar keyframes differ before position completion')
+            segment['common_keyframes'] = deepcopy(after)
+
+
+def verify_staged_inputs(timeline, files, out):
+    """Check final bytes and embedded/sidecar content with relocated paths."""
+    for name, info in files.items():
+        path = out / name
+        j.require(path.is_file() and not path.is_symlink() and path.resolve().is_relative_to(out.resolve())
+                  and path.stat().st_size == info['size'] and j.nd.digest(path) == info['sha256'],
+                  'Staged export input changed: ' + name)
+    for owner, child in compound.graph(timeline):
+        if owner is None:
+            continue
+        paths = compound.paths(owner, out)
+        j.require(all(str(path.relative_to(out)) in files for path in paths.values()),
+                  'Staged compound sidecar is missing from the input manifest')
+        sidecar = j.read_json(paths['draft_file_path'])
+        wrapped = sidecar.get('materials', {}).get('drafts', [])
+        j.require(len(wrapped) == 1 and wrapped[0].get('id') == owner['id'] and
+                  wrapped[0].get('combination_id') == owner['combination_id'],
+                  'Staged compound sidecar identity mismatch')
+        j.require(all(wrapped[0].get(key) == str(path) for key, path in paths.items()),
+                  'Staged compound wrapper path mismatch')
+        saved = wrapped[0].get('draft')
+        compared, _ = compound.normalize_companion_ids(child, saved, nested_root=True)
+        edit.preserved(compound.normalize_paths(child, out), compound.normalize_paths(compared, out))
+        compound.check_order(child, saved)
+        # preserved() deliberately tolerates additional native fields and compares
+        # ID-addressed lists without order. Curves must instead match exactly.
+        expected_rows = {(t['id'], track['id'], segment['id']): segment.get('common_keyframes', [])
+                         for t, track, segment in compound.all_segments(child)}
+        actual_rows = {(t['id'], track['id'], segment['id']): segment.get('common_keyframes', [])
+                       for t, track, segment in compound.all_segments(saved)}
+        j.require(expected_rows == actual_rows, 'Staged compound keyframe content, identity or order changed')
+        config = j.read_json(paths['draft_config_path'])
+        j.require(config.get('id') == child['id'] and config.get('project_id') == child['id'] and
+                  config.get('cover_path') == str(paths['draft_cover_path']) and
+                  config.get('draft_json_file') == 'draft_content.json',
+                  'Staged compound configuration identity/path changed')
+
+
 def stage_timeline(timeline, record, folder, out):
     value = deepcopy(timeline)
     target = Path(record['target']).resolve()
     files, mapping, canonical_mapping = {}, {}, {}
     sidecars = []
+    profile = record['runtime_profile']
+    validate_export_profiles(profile, profile)
 
     def copy_file(relative, info):
         copied = out / relative
@@ -259,7 +338,11 @@ def stage_timeline(timeline, record, folder, out):
         j.require(j.nd.digest(copied) == info['sha256'] == j.nd.digest(source), 'Export dependency changed while copying')
         files[str(relative)] = info
 
-    graph = list(compound.graph(value)) if value.get('materials', {}).get('drafts') else [(None, value)]
+    graph = list(compound.graph(value))
+    for _, child in graph:
+        validate_timeline_schema(child, profile)
+    if len(graph) > 1:
+        compound.check_sidecars(value, target, folder, edit.preserved)
     nodes = [(bucket, node) for _, timeline_node in graph
              for bucket in ('videos', 'audios', 'common_mask', 'transitions', 'video_effects', 'audio_effects', 'effects')
              for node in timeline_node.get('materials', {}).get(bucket, [])]
@@ -317,7 +400,7 @@ def stage_timeline(timeline, record, folder, out):
             if key == 'draft_cover_path':
                 copy_file(relative, info)
             else:
-                sidecars.append((relative, j.read_json(source), info))
+                sidecars.append((relative, j.read_json(source), info, key))
 
     def replace(item, key='', sidecar_base=None):
         if isinstance(item, dict):
@@ -356,13 +439,18 @@ def stage_timeline(timeline, record, folder, out):
                 raise ValueError('Online dependency is not supported by isolated export')
         return item
 
-    for relative, sidecar, info in sidecars:
+    changes = complete_position_keyframes(value, profile)
+    for relative, sidecar, info, key in sidecars:
+        if key == 'draft_file_path' and changes:
+            sync_position_keyframes(sidecar['materials']['drafts'][0]['draft'], changes)
         destination = out / relative
         destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         j.write(destination, replace(sidecar, sidecar_base=destination.parent))
         files[str(relative)] = {'sha256': j.nd.digest(destination), 'size': destination.stat().st_size}
         j.require(j.nd.digest(folder / relative) == info['sha256'], 'Compound source sidecar changed while staging')
-    return replace(value), files
+    staged = replace(value)
+    verify_staged_inputs(staged, files, out)
+    return staged, files
 
 
 def settings_for(timeline, bitrate, timeout):
@@ -501,8 +589,7 @@ def run(build, out, bitrate=4_000_000, timeout=600):
         j.write(job / 'decode.stderr.log', decoded.stderr)
         j.require(decoded.returncode == 0, 'Native MP4 did not fully decode')
         evidence['full_decode_passed'] = True
-        j.require(all(j.nd.digest(job / name) == item['sha256'] for name, item in files.items()),
-                  'Native export modified an input resource')
+        verify_staged_inputs(staged, files, job)
         j.require(j.nd.digest(job / 'timeline.json') == timeline_hash, 'Native export modified its timeline input')
         j.require(j.files_manifest(build / 'draft') == record['files'], 'Source build changed during export')
         evidence.update(status='encoded-and-decoded', output=str(output), output_sha256=j.nd.digest(output),
