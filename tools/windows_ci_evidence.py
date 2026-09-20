@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Create retained Windows FFmpeg evidence from the reviewed public media fixture."""
 import json
+import os
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'engine'))
-import windows_export
 import windows_portable
 
 
@@ -43,8 +44,17 @@ def main():
             ]}
     plan_path = input_dir / 'plan.json'
     plan_path.write_bytes(windows_portable.packed(plan))
-    windows_portable.build(plan_path, build)
-    result = windows_export.run(build, export, font=font)
+    entry = ROOT / 'skills/yichen-jianying-edit/scripts/headless_draft.py'
+    environment = dict(os.environ, JIANYING_HEADLESS_ROOT=str(ROOT))
+    commands = [
+        [sys.executable, str(entry), 'build', '--plan', str(plan_path), '--out', str(build)],
+        [sys.executable, str(entry), 'verify-build', '--build', str(build)],
+        [sys.executable, str(entry), 'export', '--backend', 'windows-ffmpeg',
+         '--build', str(build), '--out', str(export), '--font', str(font)],
+    ]
+    for command in commands:
+        subprocess.run(command, cwd=ROOT, env=environment, check=True, timeout=900)
+    result = windows_portable.read_json(export / 'result.json')
     if not result['full_decode_passed'] or not result['source_build_unchanged']:
         raise SystemExit('Windows evidence did not pass final verification')
     print(json.dumps({'status': result['status'], 'output_sha256': result['output_sha256'],
