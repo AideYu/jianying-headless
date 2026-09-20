@@ -70,6 +70,9 @@ ffprobe -version
 
 **成功标志：**三个工具都能打印版本，Python 不低于 3.9。不需要 `pip install`，本教程的工具使用 Python 标准库。
 
+后续若要显式指定本地字体，再按[字体使用说明](LOCAL-FONTS.md#optional-font-parser)
+安装可选解析依赖。本教程的默认字体流程和已有快照的验证不需要该依赖。
+
 若 `brew` 提示找不到命令，先执行安装器给出的 Next steps，再重新打开终端；不要继续复制后续步骤。
 
 ## 第 3 步：准备剪映首页
@@ -104,6 +107,17 @@ cd ~/Documents/jianying-headless
 ```
 
 ## 第 5 步：检查条件，构建桥接组件
+
+可以先执行只读精确工具链检查：
+
+```bash
+python3 tools/build_native_codec.py --check-toolchain
+```
+
+它会寻找符合要求的工具链，不改变系统默认设置。有多个 Xcode 时可加
+`--developer-dir /Applications/Xcode.app/Contents/Developer` 指定目录；
+该参数同样适用于后面的构建命令。完整版本和仍待解决事项见
+[Issue 修复进展](ISSUE-REMEDIATION.md)。
 
 先运行新手检查：
 
@@ -205,6 +219,8 @@ python3 tools/start_here.py build
 | 导出超时或帧数不一致 | 已知问题仍在调查，保留日志并停止交付；不要关闭帧数检查 |
 
 求助时提供：芯片类型、macOS 版本、剪映版本、检查失败行、编译器和 SDK 版本、失败步骤。
+剪映安装版本不匹配时，可运行 `python3 tools/runtime_report.py` 获取不含个人路径、
+素材或账号信息的报告。报告不会上传任何数据；官方签名通过也不代表新版本已适配。
 分享日志前删去个人路径、草稿名或素材信息；不要上传账号数据、官方程序库或私人视频。
 
 ## 跑通之后

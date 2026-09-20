@@ -42,7 +42,10 @@ def validate_identity(info, fingerprint):
             or info.get('CFBundleIdentifier') != 'com.lemon.lvpro'):
         raise ValueError('Unsupported Jianying version/build/identity; stop native writes')
     if fingerprint != PROFILES[version]:
-        raise ValueError('Editor library differs from its exact headless runtime profile')
+        raise ValueError('Editor library differs from its exact headless runtime profile; version='
+                         + version + '; actual=' + str(fingerprint) + '; expected=' + PROFILES[version]
+                         + '. Collect a redacted report with python3 tools/runtime_report.py. '
+                         'This build needs review; do not replace the expected hash.')
     return version
 
 

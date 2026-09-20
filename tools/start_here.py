@@ -21,7 +21,9 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'engine'))
+sys.path.insert(0, str(ROOT / 'tools'))
 from runtime_profiles import validate_identity
+from build_toolchain import select_toolchain
 
 APP = Path('/Applications/VideoFusion-macOS.app')
 ENTRY = ROOT / 'skills/yichen-jianying-edit/scripts/headless_draft.py'
@@ -57,16 +59,14 @@ def check():
             '已找到' if shutil.which(tool) else '未找到；安装后重新打开终端')
     if supported:
         try:
-            compiler = run(['/usr/bin/xcrun', 'clang++', '--version'])
-            sdk = run(['/usr/bin/xcrun', '--show-sdk-version'])
-            ok = compiler.returncode == sdk.returncode == 0
-            add('PASS' if ok else 'FAIL', '编译工具', compiler.stdout.splitlines()[0] if ok else '请先安装 Xcode 编译工具')
-            if ok:
-                exact = 'clang version 21.0.0' in compiler.stdout and sdk.stdout.strip() == '26.5'
-                add('PASS' if exact else 'WARN', '已验工具链',
-                    'SDK ' + sdk.stdout.strip() + '；已验组合为 Apple clang 21.0.0 / SDK 26.5，最终以构建哈希为准')
-        except (OSError, subprocess.SubprocessError) as error:
-            add('FAIL', '编译工具', str(error))
+            manifest = json.loads((ROOT / 'bridge/SOURCE_MANIFEST.json').read_text())
+            _, toolchain = select_toolchain(manifest['reproduction_environment'])
+            add('PASS', '已验工具链', toolchain['compiler'] + ' / SDK ' + toolchain['sdk_version']
+                + ' / linker ' + toolchain['linker'] + '；最终仍须校验编译产物')
+        except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
+            # An already-verified codec does not need recompilation.
+            add('WARN' if (ROOT / 'bridge/jy14_codec_hardened_11_4').is_file() else 'FAIL',
+                '编译工具', str(error))
     try:
         info = plistlib.loads((APP / 'Contents/Info.plist').read_bytes())
         version = validate_identity(info, digest(APP / 'Contents/Frameworks/libvideoeditor.dylib'))
