@@ -71,6 +71,31 @@ def field_owner(document, location):
 
 
 LOCATIONS = ('fps', 'speed_material', 'video_segment', 'audio_segment')
+SPEED_SHAPES = ('ordinary', 'mode_one', 'curve_empty', 'curve_points')
+
+
+def speed_context(shape, kind='video'):
+    """The four material shapes from the 11.5 native parsing experiment.
+
+    Audio/segment omission cases extend offline coverage only; the recorded
+    native experiment changed the video material's speed, not its segment.
+    """
+    document = timeline()
+    material = document['materials']['speeds'][0 if kind == 'video' else 1]
+    material.update(mode=0 if shape == 'ordinary' else 1, curve_speed=None)
+    if shape in ('curve_empty', 'curve_points'):
+        material['curve_speed'] = {
+            'id': '6768730851543880206', 'name': 'test', 'source_platform': 0,
+            'speed_points': [] if shape == 'curve_empty' else [
+                {'x': 0.0, 'y': 1.0}, {'x': 0.5, 'y': 2.0}, {'x': 1.0, 'y': 1.0}],
+        }
+    return document
+
+
+def speed_owners(document, kind):
+    index = 0 if kind == 'video' else 1
+    return (document['materials']['speeds'][index],
+            document['tracks'][index]['segments'][0])
 
 
 def compound_timeline():
@@ -148,6 +173,195 @@ class DefaultOmissionAcceptance(ComparisonAssertions):
                 self.assertAccepted(omitted, explicit)
                 field_owner(explicit['materials']['drafts'][0]['draft'], location)[0][key] = 60 if key == 'fps' else 1.5
                 self.assertRejected(omitted, explicit)
+
+
+class ModeAndCurveSpeedControls(ComparisonAssertions):
+    """Default filling must retain speed context, references and other values.
+
+    These are comparator contracts, not native curve save/export acceptance.
+    See docs/SAVED-DEFAULTS-115.md for the separate native evidence boundary.
+    """
+
+    def test_material_defaults_only_in_supported_shapes(self):
+        for shape in SPEED_SHAPES:
+            with self.subTest(shape=shape):
+                explicit = speed_context(shape)
+                omitted = deepcopy(explicit)
+                del speed_owners(omitted, 'video')[0]['speed']
+                check = self.assertAccepted if shape in ('ordinary', 'curve_points') else self.assertRejected
+                check(explicit, omitted)
+                check(omitted, explicit)
+
+    def test_linked_segment_defaults_follow_owner_context(self):
+        for kind in ('video', 'audio'):
+            for shape in SPEED_SHAPES:
+                for owners in ((0,), (1,), (0, 1)):
+                    with self.subTest(kind=kind, shape=shape, owners=owners):
+                        explicit = speed_context(shape, kind)
+                        omitted = deepcopy(explicit)
+                        for index in owners:
+                            del speed_owners(omitted, kind)[index]['speed']
+                        supported = shape == 'ordinary' or (kind == 'video' and shape == 'curve_points')
+                        check = self.assertAccepted if supported else self.assertRejected
+                        check(explicit, omitted)
+                        check(omitted, explicit)
+
+    def test_unsupported_shapes_with_explicit_speeds_remain_comparable(self):
+        for kind in ('video', 'audio'):
+            for shape in SPEED_SHAPES:
+                document = speed_context(shape, kind)
+                self.assertAccepted(document, deepcopy(document))
+
+    def test_both_sides_missing_speed_in_empty_curve_are_rejected(self):
+        for shape in ('mode_one', 'curve_empty'):
+            for owner in (0, 1):
+                document = speed_context(shape)
+                del speed_owners(document, 'video')[owner]['speed']
+                self.assertRejected(document, deepcopy(document))
+
+    def test_unknown_mode_and_preset_do_not_gain_speed_defaults(self):
+        for change in ('mode', 'preset', 'point_order', 'invalid_point'):
+            explicit = speed_context('curve_points')
+            material = speed_owners(explicit, 'video')[0]
+            if change == 'mode':
+                material['mode'] = 2
+            elif change == 'preset':
+                material['curve_speed']['id'] = 'unverified-preset'
+            elif change == 'point_order':
+                material['curve_speed']['speed_points'][1]['x'] = 1
+            else:
+                material['curve_speed']['speed_points'][1]['y'] = False
+            for owner in (0, 1):
+                omitted = deepcopy(explicit)
+                del speed_owners(omitted, 'video')[owner]['speed']
+                self.assertRejected(explicit, omitted)
+                self.assertRejected(omitted, explicit)
+
+    def test_orphan_and_ambiguous_speed_materials_do_not_gain_defaults(self):
+        for ambiguous in (False, True):
+            explicit = speed_context('ordinary')
+            explicit['materials']['speeds'].append({'id': 'extra-speed', 'type': 'speed', 'speed': 1})
+            if ambiguous:
+                explicit['tracks'][0]['segments'][0]['extra_material_refs'].append('extra-speed')
+            omitted = deepcopy(explicit)
+            del omitted['materials']['speeds'][-1]['speed']
+            self.assertRejected(explicit, omitted)
+            self.assertRejected(omitted, explicit)
+
+    def test_nondefault_material_or_segment_is_rejected_in_both_directions(self):
+        for kind in ('video', 'audio'):
+            for shape in SPEED_SHAPES:
+                for index in (0, 1):
+                    with self.subTest(kind=kind, shape=shape, owner=index):
+                        explicit = speed_context(shape, kind)
+                        speed_owners(explicit, kind)[index]['speed'] = 1.5
+                        omitted = deepcopy(explicit)
+                        del speed_owners(omitted, kind)[index]['speed']
+                        self.assertRejected(explicit, omitted)
+                        self.assertRejected(omitted, explicit)
+
+    def test_segment_default_cannot_hide_a_linked_material_speed_change(self):
+        for kind in ('video', 'audio'):
+            for shape in SPEED_SHAPES:
+                with self.subTest(kind=kind, shape=shape):
+                    expected = speed_context(shape, kind)
+                    actual = deepcopy(expected)
+                    material, segment = speed_owners(actual, kind)
+                    material['speed'] = 1.5
+                    del segment['speed']
+                    self.assertRejected(expected, actual)
+                    self.assertRejected(actual, expected)
+
+    def test_speed_default_cannot_hide_mode_or_curve_changes(self):
+        for change in ('mode', 'point', 'curve_removed'):
+            with self.subTest(change=change):
+                expected = speed_context('curve_points')
+                actual = deepcopy(expected)
+                material = speed_owners(actual, 'video')[0]
+                del material['speed']
+                if change == 'mode':
+                    material['mode'] = 0
+                elif change == 'point':
+                    material['curve_speed']['speed_points'][1]['y'] = 3.0
+                else:
+                    material['curve_speed'] = None
+                self.assertRejected(expected, actual)
+                self.assertRejected(actual, expected)
+
+    def test_ordinary_mode_and_empty_curve_representations_remain_equivalent(self):
+        for kind in ('video', 'audio'):
+            for curve in (None, ''):
+                with self.subTest(kind=kind, curve=curve):
+                    expected = timeline()
+                    actual = deepcopy(expected)
+                    material, segment = speed_owners(actual, kind)
+                    material.update(mode=0, curve_speed=curve)
+                    del material['speed']
+                    del segment['speed']
+                    self.assertAccepted(expected, actual)
+                    self.assertAccepted(actual, expected)
+
+    def test_known_child_timeline_cannot_acquire_a_new_speed_context(self):
+        expected = compound_timeline()
+        actual = deepcopy(expected)
+        child = actual['materials']['drafts'][0]['draft']
+        material, segment = speed_owners(child, 'video')
+        material.update(mode=1, curve_speed=deepcopy(
+            speed_owners(speed_context('curve_points'), 'video')[0]['curve_speed']))
+        del material['speed']
+        del segment['speed']
+        self.assertRejected(expected, actual)
+        self.assertRejected(actual, expected)
+
+    def test_curve_field_additions_and_mode_type_changes_are_rejected(self):
+        for change in ('curve_field', 'boolean_mode', 'float_mode'):
+            with self.subTest(change=change):
+                expected = speed_context('curve_points')
+                actual = deepcopy(expected)
+                material = speed_owners(actual, 'video')[0]
+                if change == 'curve_field':
+                    material['curve_speed']['new_setting'] = 'changed'
+                else:
+                    material['mode'] = True if change == 'boolean_mode' else 1.0
+                self.assertRejected(expected, actual)
+                self.assertRejected(actual, expected)
+
+    def test_speed_default_cannot_hide_a_changed_material_reference(self):
+        for shape in SPEED_SHAPES:
+            for reference in ([], ['audio-speed'], ['missing-speed']):
+                with self.subTest(shape=shape, reference=reference):
+                    expected = speed_context(shape)
+                    actual = deepcopy(expected)
+                    _, segment = speed_owners(actual, 'video')
+                    del segment['speed']
+                    segment['extra_material_refs'] = reference
+                    self.assertRejected(expected, actual)
+                    self.assertRejected(actual, expected)
+
+    def test_equal_inputs_with_dangling_speed_reference_are_rejected(self):
+        for shape in SPEED_SHAPES:
+            with self.subTest(shape=shape):
+                document = speed_context(shape)
+                material, segment = speed_owners(document, 'video')
+                del material['speed']
+                segment['extra_material_refs'] = ['missing-speed']
+                self.assertRejected(document, deepcopy(document))
+
+    def test_generic_and_legacy_comparison_keep_their_existing_curve_rules(self):
+        for shape in SPEED_SHAPES:
+            with self.subTest(shape=shape):
+                expected = speed_context(shape)
+                expected['new_version'] = '185.0.0'
+                actual = deepcopy(expected)
+                del speed_owners(actual, 'video')[0]['speed']
+                if shape == 'ordinary':
+                    edit.preserved(expected, actual)
+                    edit.compare_saved_timeline(expected, actual, LEGACY_PROFILE)
+                else:
+                    with self.assertRaisesRegex(ValueError, 'disappeared'):
+                        edit.preserved(expected, actual)
+                    with self.assertRaisesRegex(ValueError, 'disappeared'):
+                        edit.compare_saved_timeline(expected, actual, LEGACY_PROFILE)
 
 
 class EquivalentRepresentationControls(ComparisonAssertions):
@@ -442,6 +656,74 @@ def saved_copy_fixture(expected, actual, profile=PROFILE):
 
 
 class VerifyLiveEntryTests(unittest.TestCase):
+    def test_new_speed_context_is_rejected_with_or_without_default_omissions(self):
+        for shape in ('mode_only', 'flat_curve', 'nonflat_curve'):
+            for omitted_owners in ((), (0,), (1,), (0, 1)):
+                for reverse in (False, True):
+                    with self.subTest(shape=shape, omitted=omitted_owners, reverse=reverse):
+                        expected = timeline()
+                        actual = deepcopy(expected)
+                        material = speed_owners(actual, 'video')[0]
+                        material['mode'] = 1
+                        if shape != 'mode_only':
+                            material['curve_speed'] = deepcopy(
+                                speed_owners(speed_context('curve_points'), 'video')[0]['curve_speed'])
+                            if shape == 'flat_curve':
+                                for point in material['curve_speed']['speed_points']:
+                                    point['y'] = 1.0
+                        for owner in omitted_owners:
+                            del speed_owners(actual, 'video')[owner]['speed']
+                        if reverse:
+                            expected, actual = actual, expected
+                        with saved_copy_fixture(expected, actual) as (out, _, __):
+                            files = edit.j.files_manifest(out.parent)
+                            with self.assertRaises(ValueError):
+                                edit.verify_live(out)
+                            self.assertEqual(edit.j.files_manifest(out.parent), files)
+
+    def test_four_speed_shapes_use_full_verification_in_both_directions(self):
+        for shape in SPEED_SHAPES:
+            for reverse in (False, True):
+                with self.subTest(shape=shape, reverse=reverse):
+                    explicit = speed_context(shape)
+                    omitted = deepcopy(explicit)
+                    del speed_owners(omitted, 'video')[0]['speed']
+                    expected, actual = (omitted, explicit) if reverse else (explicit, omitted)
+                    with saved_copy_fixture(expected, actual) as (out, target, source):
+                        before = edit.j.files_manifest(out.parent)
+                        if shape in ('ordinary', 'curve_points'):
+                            result = edit.verify_live(out)
+                            self.assertEqual(result['status'], 'verified')
+                            self.assertTrue(result['four_mirrors_equal'])
+                            self.assertTrue(result['source_files_unchanged'])
+                        else:
+                            with self.assertRaisesRegex(ValueError, 'unverified native speed context'):
+                                edit.verify_live(out)
+                        self.assertEqual(edit.j.files_manifest(out.parent), before)
+
+    def test_four_speed_shapes_reject_nondefaults_and_rebinding_in_full_entry(self):
+        for shape in SPEED_SHAPES:
+            for change in ('material', 'segment', 'reference'):
+                for reverse in (False, True):
+                    with self.subTest(shape=shape, change=change, reverse=reverse):
+                        expected = speed_context(shape)
+                        material, segment = speed_owners(expected, 'video')
+                        del material['speed']
+                        del segment['speed']
+                        actual = deepcopy(expected)
+                        material, segment = speed_owners(actual, 'video')
+                        if change == 'reference':
+                            segment['extra_material_refs'] = ['audio-speed']
+                        else:
+                            (material if change == 'material' else segment)['speed'] = 1.5
+                        if reverse:
+                            expected, actual = actual, expected
+                        with saved_copy_fixture(expected, actual) as (out, target, source):
+                            before = edit.j.files_manifest(out.parent)
+                            with self.assertRaises(ValueError):
+                                edit.verify_live(out)
+                            self.assertEqual(edit.j.files_manifest(out.parent), before)
+
     def test_saved_defaults_pass_complete_verification_with_explicit_doctor_profile(self):
         expected = timeline()
         expected['tracks'][0]['name'] = 'renamed fixture track'

@@ -244,8 +244,9 @@ def source_in_build(raw, target, folder):
 def complete_position_keyframes(timeline, runtime_profile):
     """Add the observed 11.5 static-Y workaround once in the render copy.
 
-    Existing channels and their IDs remain exact. Point offsets are segment-local;
-    the constant curve does not change an imported X curve or its time mapping.
+    Existing channels, IDs and native offsets remain exact. Ordinary fixed-speed
+    video uses source-time offsets; this constant curve does not convert an
+    imported X curve or its time mapping.
     The returned changes are reused by every compound representation.
     """
     changes = {}
