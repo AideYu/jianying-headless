@@ -4,11 +4,16 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 import native_export as e
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'bridge'))
+import runtime_io
 
 WORK = Path(os.environ['JY_NATIVE_EXPORT_TEST_WORK']).resolve()
 WORK.mkdir(parents=True, exist_ok=True)
@@ -24,11 +29,25 @@ class ExportGuards(unittest.TestCase):
         self.source = self.folder / self.relative
         self.source.parent.mkdir(parents=True)
         self.source.write_bytes(b'owned test bytes')
+        # These guards use the real strict parser without codec preflight. No
+        # native output, runtime fingerprint or renderer result is simulated.
+        helper = patch.object(e.j.nd, 'helper', return_value=SimpleNamespace(
+            _parse_strict_json=runtime_io._parse_strict_json))
+        helper.start()
+        self.addCleanup(helper.stop)
         self.settings = dict(width=1280, height=720, fps=25, bitrate=4_000_000, timeout_seconds=60)
         self.probe = {'format': {'duration': '6.0', 'tags': {'major_brand': 'isom'}},
                       'streams': [{'codec_type': 'video', 'codec_name': 'h264', 'width': 1280, 'height': 720,
                                    'r_frame_rate': '25/1', 'nb_frames': '150'},
                                   {'codec_type': 'audio', 'codec_name': 'aac'}]}
+
+    def timeline_fixture(self, materials=None, **fields):
+        """A reviewed 11.5 timeline envelope for staging-only resource fixtures."""
+        timeline = deepcopy(e.j.blueprint()['timeline'])
+        timeline.update(id=e.j.identifier(), new_version='187.0.0', version=360000,
+                        fps=30, duration=0, tracks=[], materials=materials or {})
+        timeline.update(fields)
+        return timeline
 
     def test_native_placeholder_resolves_to_build_not_live(self):
         source, relative = e.source_in_build(e.j.DRAFT_PATH_TOKEN + str(self.relative), self.target, self.folder)
@@ -50,8 +69,8 @@ class ExportGuards(unittest.TestCase):
     def test_changed_dependency_is_not_staged(self):
         out = self.root / 'output'; out.mkdir()
         raw = str(self.target / self.relative)
-        timeline = {'materials': {'videos': [{'path': raw}]}}
-        record = {'target': str(self.target), 'files': {str(self.relative): {'size': 16, 'sha256': '0' * 64}}}
+        timeline = self.timeline_fixture({'videos': [{'path': raw}]})
+        record = {'target': str(self.target), 'runtime_profile': 'jy14-headless-macos-11.5.0', 'files': {str(self.relative): {'size': 16, 'sha256': '0' * 64}}}
         with self.assertRaisesRegex(ValueError, 'manifest'):
             e.stage_timeline(timeline, record, self.folder, out)
         self.assertFalse((out / self.relative).exists())
@@ -59,8 +78,8 @@ class ExportGuards(unittest.TestCase):
     def test_stage_copies_and_rewrites_dependency_without_mutating_input(self):
         out = self.root / 'output'; out.mkdir()
         raw = str(self.target / self.relative)
-        timeline = {'materials': {'videos': [{'path': raw}]}}
-        record = {'target': str(self.target), 'files': {str(self.relative): {
+        timeline = self.timeline_fixture({'videos': [{'path': raw}]})
+        record = {'target': str(self.target), 'runtime_profile': 'jy14-headless-macos-11.5.0', 'files': {str(self.relative): {
             'size': self.source.stat().st_size, 'sha256': e.j.nd.digest(self.source)}}}
         value, files = e.stage_timeline(timeline, record, self.folder, out)
         self.assertEqual(value['materials']['videos'][0]['path'], str(out / self.relative))
@@ -69,18 +88,21 @@ class ExportGuards(unittest.TestCase):
         self.assertEqual(files, record['files'])
 
     def test_unknown_resource_and_online_dependency_rejected(self):
-        for node in ({'mystery_path': '/outside/file'}, {'resource_url': 'https://example.test/private'}):
-            with self.assertRaises(ValueError):
-                e.stage_timeline(node, {'target': str(self.target)}, self.folder, self.root)
+        for node, error in (({'mystery_path': '/outside/file'}, 'Unstaged/unsupported export resource path'),
+                            ({'resource_url': 'https://example.test/private'}, 'Online dependency')):
+            with self.assertRaisesRegex(ValueError, error):
+                e.stage_timeline(self.timeline_fixture(**node),
+                                 {'target': str(self.target), 'files': {},
+                                  'runtime_profile': 'jy14-headless-macos-11.5.0'}, self.folder, self.root)
 
     def test_serialized_text_style_path_staged_but_literal_text_unchanged(self):
         out = self.root / 'text-output'; out.mkdir()
         raw = str(self.target / self.relative)
         content = {'text': raw, 'styles': [{'effectStyle': {'id': 'test-style', 'path': raw}}]}
-        timeline = {'materials': {'videos': [{'path': raw}],
-                                 'texts': [{'type': 'text', 'content': json.dumps(content)}]}}
+        timeline = self.timeline_fixture({'videos': [{'path': raw}],
+                                          'texts': [{'type': 'text', 'content': json.dumps(content)}]})
         original = deepcopy(timeline)
-        record = {'target': str(self.target), 'files': {str(self.relative): {
+        record = {'target': str(self.target), 'runtime_profile': 'jy14-headless-macos-11.5.0', 'files': {str(self.relative): {
             'size': self.source.stat().st_size, 'sha256': e.j.nd.digest(self.source)}}}
         staged, files = e.stage_timeline(timeline, record, self.folder, out)
         actual = json.loads(staged['materials']['texts'][0]['content'])
@@ -91,16 +113,17 @@ class ExportGuards(unittest.TestCase):
 
     def test_serialized_text_cannot_hide_external_or_ambiguous_style_paths(self):
         contents = [
-            json.dumps({'text': 'https://example.test is literal subtitle text', 'styles': [
-                {'effectStyle': {'id': 'not-staged', 'path': '/outside/style'}}]}),
-            json.dumps({'text': 'font', 'styles': [{'font': {'path': '/outside/font.ttf'}}]}),
-            '{"text":"duplicate","styles":[],"styles":[{"effectStyle":{"path":"/outside/style"}}]}',
-            'not valid native text JSON',
+            (json.dumps({'text': 'https://example.test is literal subtitle text', 'styles': [
+                {'effectStyle': {'id': 'not-staged', 'path': '/outside/style'}}]}), 'Unstaged/unsupported export resource path'),
+            (json.dumps({'text': 'font', 'styles': [{'font': {'path': '/outside/font.ttf'}}]}), 'Unstaged/unsupported export resource path'),
+            ('{"text":"duplicate","styles":[],"styles":[{"effectStyle":{"path":"/outside/style"}}]}', 'duplicate object key'),
+            ('not valid native text JSON', 'not strict UTF-8 JSON'),
         ]
-        for content in contents:
-            with self.subTest(content=content), self.assertRaises((ValueError, RuntimeError)):
-                e.stage_timeline({'materials': {'texts': [{'type': 'text', 'content': content}]}},
-                                 {'target': str(self.target)}, self.folder, self.root)
+        for content, error in contents:
+            with self.subTest(content=content), self.assertRaisesRegex((ValueError, runtime_io.ApplyError), error):
+                e.stage_timeline(self.timeline_fixture({'texts': [{'type': 'text', 'content': content}]}),
+                                 {'target': str(self.target), 'files': {},
+                                  'runtime_profile': 'jy14-headless-macos-11.5.0'}, self.folder, self.root)
 
     def test_quicktime_mislabeled_mp4_rejected(self):
         self.probe['format']['tags']['major_brand'] = 'qt  '
@@ -186,10 +209,10 @@ class ExportGuards(unittest.TestCase):
         (folder / 'config.json').write_bytes(b'{}')
         node = e.motion.mask_material({'shape': 'circle'}, self.target)
         node['path'] = str(self.target / relative)
-        record = {'target': str(self.target), 'files': {
+        record = {'target': str(self.target), 'runtime_profile': 'jy14-headless-macos-11.5.0', 'files': {
             str(relative / 'config.json'): {'size': 2, 'sha256': e.j.nd.digest(folder / 'config.json')}}}
         with self.assertRaisesRegex(ValueError, 'captured native resource'):
-            e.stage_timeline({'materials': {'common_mask': [node]}}, record, self.folder, out)
+            e.stage_timeline(self.timeline_fixture({'common_mask': [node]}), record, self.folder, out)
         self.assertFalse((out / relative).exists())
 
     def test_unverified_effects_and_animations_rejected(self):
@@ -253,10 +276,10 @@ class ExportGuards(unittest.TestCase):
         (folder / 'config.json').write_bytes(b'{}')
         node = deepcopy(e.resources.definition('effect/light-shake')['material'])
         node['path'] = str(self.target / relative)
-        record = {'target': str(self.target), 'files': {
+        record = {'target': str(self.target), 'runtime_profile': 'jy14-headless-macos-11.5.0', 'files': {
             str(relative / 'config.json'): {'size': 2, 'sha256': e.j.nd.digest(folder / 'config.json')}}}
         with self.assertRaisesRegex(ValueError, 'captured native resource'):
-            e.stage_timeline({'materials': {'video_effects': [node]}}, record, self.folder, out)
+            e.stage_timeline(self.timeline_fixture({'video_effects': [node]}), record, self.folder, out)
         self.assertFalse((out / relative).exists())
 
     def test_known_dissolve_and_empty_native_defaults_accepted(self):

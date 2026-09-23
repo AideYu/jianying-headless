@@ -794,6 +794,7 @@ print('default-build, ordinary-edit, legacy-readback, font-snapshot, export: pas
         folder = self.folder / 'edited/draft'
         fonts.copy_assets([asset], folder)
         record = {'schema': edit.BUILD_SCHEMA, 'target': str(self.target),
+                  'runtime_profile': 'jy14-headless-macos-11.5.0',
                   'font_assets': [asset], 'files': j.files_manifest(folder)}
         parser = SimpleNamespace(_parse_strict_json=runtime_io._parse_strict_json)
         with patch.object(j.nd, 'helper', return_value=parser):

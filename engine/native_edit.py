@@ -10,6 +10,7 @@ import json
 import math
 import os
 from pathlib import Path
+import platform
 import re
 import shutil
 import time
@@ -623,6 +624,200 @@ def normalize_saved_provenance(before, after, runtime):
     return changed
 
 
+def compare_saved_timeline(expected, actual, runtime_profile, *, frame_tolerance=0, quantized=None):
+    """Compare native save output with explicit, validated timeline context.
+
+    Only 11.5 interprets absent fps/speed as native defaults. Walk real compound
+    timelines in comparison copies; similarly named plugin data stays strict.
+    Normalize both sides so an omitted expected default cannot hide a new value.
+    Check known speed contexts in both directions; new modes/curves are not
+    harmless native metadata additions.
+    Other callers of preserved() retain the existing upstream rules.
+    """
+    j.require(runtime_profile is not None, 'Saved timeline comparison requires an explicit runtime profile')
+
+    def comparison_copy(value):
+        value = deepcopy(value)
+        rows = compound.validate(value, basic_validation)
+        for _, timeline in rows:
+            validate_timeline_schema(timeline, runtime_profile)
+        if runtime_profile != 'jy14-headless-macos-11.5.0':
+            return value, {}
+
+        speed_contexts = {}
+
+        def default(node, key, number):
+            # setdefault alone is insufficient: bool == 1 in Python, and the
+            # generic comparator intentionally retains its existing semantics.
+            if key not in node:
+                node[key] = number
+            else:
+                j.require(type(node[key]) in (int, float) and math.isfinite(node[key]) and node[key] > 0,
+                          'Invalid native saved ' + key)
+
+        def supported_speed_context(material, kind):
+            mode, curve = material.get('mode', 0), material.get('curve_speed')
+            if type(mode) is not int:
+                return False
+            if mode == 0 and curve in (None, ''):
+                return kind in ('video', 'audio')
+            if not (kind == 'video' and mode == 1 and isinstance(curve, dict)
+                    and curve.get('id') == '6768730851543880206'):
+                return False
+            points = curve.get('speed_points')
+            if not isinstance(points, list) or len(points) < 2:
+                return False
+            if not all(isinstance(p, dict) and all(type(p.get(k)) in (int, float)
+                       and math.isfinite(p[k]) for k in ('x', 'y'))
+                       and 0 <= p['x'] <= 1 and p['y'] > 0 for p in points):
+                return False
+            return (points[0]['x'] == 0 and points[-1]['x'] == 1
+                    and all(a['x'] < b['x'] for a, b in zip(points, points[1:])))
+
+        def speed_default(node, supported):
+            # Unsupported contexts may retain explicit speeds, but missing
+            # values must not acquire an unverified meaning in either direction.
+            j.require(supported or 'speed' in node,
+                      'Missing speed in an unverified native speed context')
+            default(node, 'speed', 1)
+
+        for _, timeline in rows:
+            default(timeline, 'fps', 30)
+            index = material_index(timeline)
+            owners = {}
+            for track in timeline.get('tracks', []):
+                bucket = {'video': 'videos', 'audio': 'audios'}.get(track.get('type'))
+                for segment in track.get('segments', []):
+                    refs = [r for r in segment.get('extra_material_refs', [])
+                            if index[r][0] == 'speeds']
+                    supported = (bucket is not None and index[segment['material_id']][0] == bucket
+                                 and len(refs) == 1
+                                 and supported_speed_context(index[refs[0]][1], track['type']))
+                    for ref in refs:
+                        owners.setdefault(ref, []).append(supported)
+                    if bucket is not None and index[segment['material_id']][0] == bucket:
+                        speed_default(segment, supported)
+            for node in timeline.get('materials', {}).get('speeds', []):
+                if node.get('type') == 'speed':
+                    contexts = owners.get(node['id'], [])
+                    speed_default(node, bool(contexts) and all(contexts))
+                    mode = node.setdefault('mode', 0)
+                    curve = node.setdefault('curve_speed', None)
+                    if type(mode) is int and mode == 0 and curve in (None, ''):
+                        node['curve_speed'] = None
+                    speed_contexts[timeline['id'], node['id']] = (
+                        type(mode), mode, node['curve_speed'])
+        return value, speed_contexts
+
+    before, old_contexts = comparison_copy(expected)
+    after, new_contexts = comparison_copy(actual)
+    for (timeline_id, material_id), context in old_contexts.items():
+        j.require(new_contexts.get((timeline_id, material_id)) == context,
+                  'Native saved speed context changed: ' + timeline_id + '/materials/speeds/' + material_id)
+    preserved(before, after, frame_tolerance=frame_tolerance, quantized=quantized)
+
+
+def normalize_saved_curve_averages(expected, actual, runtime):
+    """Recognize the observed 11.5 custom-curve frame rounding on a copy.
+
+    Both headless and native-UI copies recalculate the linked segment/material
+    average to source duration / frame-aligned target duration on first save.
+    Curve points and both ranges remain identical, allowing an omitted integer
+    zero start. This is separate from speed default filling and does not relax
+    the generic preservation comparator.
+    """
+    compared, changes = deepcopy(actual), []
+    if not (runtime == 'jy14-headless-macos-11.5.0'
+            and expected.get('new_version') == actual.get('new_version') == '187.0.0'
+            and expected.get('last_modified_platform', {}).get('app_version') == '11.5.0'
+            and actual.get('last_modified_platform', {}).get('app_version') == '11.5.0'
+            and expected.get('fps', 30) == actual.get('fps', 30) == 30
+            and not expected.get('materials', {}).get('drafts')
+            and not actual.get('materials', {}).get('drafts')):
+        return compared, changes
+
+    def positive(value):
+        return type(value) in (int, float) and math.isfinite(value) and value > 0
+
+    def same_range(before, after):
+        # Only the existing integer-zero start omission is equivalent here.
+        # Keep durations, nonzero starts and every other field exact; do not
+        # apply the general comparator's frame tolerance to this exception.
+        for value in (before, after):
+            if not (isinstance(value, dict)
+                    and type(value.get('start', 0)) is int and value.get('start', 0) >= 0
+                    and type(value.get('duration')) is int and value['duration'] > 0):
+                return False
+        return dict(before, start=before.get('start', 0)) == dict(after, start=after.get('start', 0))
+
+    old_index, new_index = material_index(expected), material_index(compared)
+    old_segments, new_segments = segments(expected), segments(compared)
+    frame_us = 1_000_000 / 30
+    for sid, (track, old) in old_segments.items():
+        new_track, new = new_segments.get(sid, ({}, {}))
+        if not (track.get('type') == new_track.get('type') == 'video'
+                and track.get('id') == new_track.get('id')
+                and old.get('material_id') == new.get('material_id')
+                and old_index.get(old.get('material_id'), ('', {}))[0] == 'videos'
+                and new_index.get(new.get('material_id'), ('', {}))[0] == 'videos'
+                and old.get('extra_material_refs') == new.get('extra_material_refs')):
+            continue
+        refs = [r for r in old.get('extra_material_refs', [])
+                if old_index.get(r, ('', {}))[0] == 'speeds']
+        if len(refs) != 1:
+            continue
+        ref = refs[0]
+        before = old_index[ref][1]
+        bucket, after = new_index.get(ref, ('', {}))
+        if not (bucket == 'speeds' and before.get('type') == after.get('type') == 'speed'
+                and type(before.get('mode')) is int and before['mode'] == 1
+                and type(after.get('mode')) is int and after['mode'] == 1
+                and {k: v for k, v in before.items() if k != 'speed'}
+                    == {k: v for k, v in after.items() if k != 'speed'}
+                and all(sum(ref in s.get('extra_material_refs', []) for _, s in rows.values()) == 1
+                        for rows in (old_segments, new_segments))):
+            continue
+        curve = before.get('curve_speed')
+        if not isinstance(curve, dict) or curve.get('id') != '6768730851543880206':
+            continue
+        def valid_points(points):
+            return (isinstance(points, list) and len(points) >= 3
+                    and all(isinstance(p, dict) and type(p.get('x')) in (int, float)
+                            and math.isfinite(p['x']) and 0 <= p['x'] <= 1 and positive(p.get('y'))
+                            for p in points)
+                    and points[0]['x'] == 0 and points[-1]['x'] == 1
+                    and all(a['x'] < b['x'] for a, b in zip(points, points[1:]))
+                    and len({p['y'] for p in points}) > 1)
+
+        if not all(valid_points(c.get('speed_points')) for c in (curve, after['curve_speed'])):
+            continue
+        old_speed, new_speed = before.get('speed'), after.get('speed')
+        if not (positive(old_speed) and positive(new_speed)
+                and old_speed != 1 and new_speed != 1
+                and type(old.get('speed')) in (int, float) and old['speed'] == old_speed
+                and type(new.get('speed')) in (int, float) and new['speed'] == new_speed
+                and abs(old_speed - new_speed) > 1e-5
+                and same_range(old.get('source_timerange'), new.get('source_timerange'))
+                and same_range(old.get('target_timerange'), new.get('target_timerange'))):
+            continue
+        source_us = old.get('source_timerange', {}).get('duration')
+        target_us = old.get('target_timerange', {}).get('duration')
+        if not (type(source_us) is int and source_us > 0
+                and type(target_us) is int and target_us > 0
+                and abs(target_us - round(target_us / frame_us) * frame_us) <= 1
+                and math.isclose(new_speed, source_us / target_us, rel_tol=1e-12, abs_tol=1e-12)):
+            continue
+        rounding_us = source_us / old_speed - target_us
+        if not 0 < rounding_us < frame_us:
+            continue
+        new['speed'] = after['speed'] = old_speed
+        changes.append({'timeline_id': expected['id'], 'segment_id': sid, 'speed_material_id': ref,
+                        'expected_speed': old_speed, 'native_speed': new_speed,
+                        'source_duration_us': source_us, 'target_duration_us': target_us,
+                        'frame_rounding_us': rounding_us})
+    return compared, changes
+
+
 def verify_live(out):
     out = Path(out).resolve(strict=True)
     record = j.read_json(out / 'build.json')
@@ -660,6 +855,19 @@ def verify_live(out):
                 change['last_modified_app_before'] = old_platform['app_version']
                 change['last_modified_app_after'] = after['last_modified_platform']['app_version']
                 after['last_modified_platform']['app_version'] = old_platform['app_version']
+            new_platform = after['last_modified_platform']
+            if 'os_version' in old_platform and old_platform['os_version'] != new_platform.get('os_version'):
+                old_os, new_os = old_platform['os_version'], new_platform.get('os_version')
+                current_os = platform.mac_ver()[0]
+                j.require(old_platform.get('os') == new_platform.get('os') == 'mac' and
+                          all(isinstance(value, str) and re.fullmatch(r'[0-9]+(?:\.[0-9]+){1,2}', value)
+                              for value in (old_os, new_os, current_os)) and new_os == current_os,
+                          'Unreviewed native save OS provenance change')
+                # Only the reviewed 185 -> 187 save migration can restamp the
+                # last-save OS to this host. Source platform remains strict.
+                new_platform['os_version'] = old_os
+                change['last_modified_os_version_before'] = old_os
+                change['last_modified_os_version_after'] = new_os
             # Native save stamps current-machine provenance. These identifiers
             # are not editing content; keep source platform and every other
             # nonempty field strict, and report names without leaking values.
@@ -672,10 +880,11 @@ def verify_live(out):
                     after['last_modified_platform'][key] = old_platform[key]
                     changed_device_fields.append(key)
             change['restamped_device_field_names'] = changed_device_fields
+    compared, curve_average_changes = normalize_saved_curve_averages(expected, compared, runtime)
     quantized = []
     normalize = compound.normalize_paths if font_assets is None else fonts.normalize_paths
-    preserved(normalize(expected, target), normalize(compared, target),
-              frame_tolerance=math.ceil(1_000_000 / expected.get('fps', 30)), quantized=quantized)
+    compare_saved_timeline(normalize(expected, target), normalize(compared, target),
+                           runtime, frame_tolerance=math.ceil(1_000_000 / expected.get('fps', 30)), quantized=quantized)
     checked_fonts = fonts.verify_assets(font_assets, actual, target, target) if font_assets is not None else 0
     compound.check_order(expected, actual)
     checked_compounds = compound.check_sidecars(actual, target, target, preserved)
@@ -696,6 +905,7 @@ def verify_live(out):
             'native_empty_companion_identity_changes': companion_identity_changes,
             'native_schema_upgrades': schema_upgrades,
             'native_provenance_restamps': provenance_restamps,
+            'native_curve_speed_recomputations': curve_average_changes,
             'native_frame_quantization': quantized, 'font_files_verified': checked_fonts,
             'native_ui_acceptance': 'requires separate open/play/save/cold-reopen evidence'}
 
