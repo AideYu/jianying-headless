@@ -466,14 +466,34 @@ def settings_for(timeline, bitrate, timeout):
     return dict(width=width, height=height, fps=fps, bitrate=bitrate, timeout_seconds=timeout)
 
 
+def sbpl_literal(path):
+    r"""Quote a path for an SBPL subpath rule; SBPL has no JSON \uXXXX form.
+
+    Non-ASCII bytes stay verbatim. SBPL reads at most two hex digits after \x,
+    so a control byte followed by a hex character cannot be over-consumed; octal
+    escapes are avoided because those do consume the following digits.
+    """
+    escapes = {0x5c: b'\\\\', 0x22: b'\\"', 0x0a: b'\\n', 0x0d: b'\\r', 0x09: b'\\t'}
+    literal = bytearray(b'"')
+    for byte in str(path).encode('utf-8', 'surrogateescape'):
+        if byte in escapes:
+            literal.extend(escapes[byte])
+        elif byte < 0x20 or byte == 0x7f:
+            literal.extend(b'\\x%02x' % byte)
+        else:
+            literal.append(byte)
+    literal.append(0x22)
+    return bytes(literal)
+
+
 def sandbox_profile(out):
-    literal = json.dumps(str(out))
-    return ('(version 1)\n(allow default)\n(deny network*)\n(deny file-write*)\n'
-            '(deny file-read-data (subpath "/Users"))\n'
-            '(deny file-read-data (subpath "/Library/Keychains"))\n'
-            f'(allow file-read-data (subpath {literal}))\n'
-            f'(allow file-write* (subpath {literal}))\n'
-            '(allow file-write* (literal "/dev/null"))\n').encode()
+    literal = sbpl_literal(out)
+    return (b'(version 1)\n(allow default)\n(deny network*)\n(deny file-write*)\n'
+            b'(deny file-read-data (subpath "/Users"))\n'
+            b'(deny file-read-data (subpath "/Library/Keychains"))\n'
+            b'(allow file-read-data (subpath ' + literal + b'))\n'
+            b'(allow file-write* (subpath ' + literal + b'))\n'
+            b'(allow file-write* (literal "/dev/null"))\n')
 
 
 def validate_probe(info, settings, duration_us, audio_expected):
