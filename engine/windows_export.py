@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import argparse
+from fractions import Fraction
 import hashlib
 import json
+import math
 from pathlib import Path
 import shutil
 import subprocess
@@ -90,8 +92,8 @@ def probe(executable, output, job, expected, timeout):
         [str(executable), '-v', 'error', '-count_frames', '-show_streams', '-show_format',
          '-of', 'json', str(output)], cwd=job, capture_output=True, text=True,
         encoding='utf-8', errors='replace', timeout=timeout)
-    (job / 'ffprobe.stdout.log').write_text(result.stdout, encoding='utf-8', newline='\n')
-    (job / 'ffprobe.stderr.log').write_text(result.stderr, encoding='utf-8', newline='\n')
+    (job / 'ffprobe.stdout.log').write_bytes(result.stdout.encode('utf-8'))
+    (job / 'ffprobe.stderr.log').write_bytes(result.stderr.encode('utf-8'))
     require(result.returncode == 0, 'ffprobe failed: ' + result.stderr.strip())
     value = json.loads(result.stdout)
     video = [s for s in value.get('streams', []) if s.get('codec_type') == 'video']
@@ -108,8 +110,16 @@ def probe(executable, output, job, expected, timeout):
     require(abs(duration - expected_seconds) <= max(.08, 2 / expected['fps']),
             'Output duration differs')
     frames = int(video[0].get('nb_read_frames') or video[0].get('nb_frames') or 0)
-    require(abs(frames - round(expected_seconds * expected['fps'])) <= 1,
-            'Output frame count differs')
+    span = Fraction(expected['duration'], 1_000_000) * int(expected['fps'])
+    nearest = round(span)
+    # A microsecond-quantized frame boundary has one valid count. Only a
+    # genuinely fractional span may round to either adjacent count.
+    aligned = abs(span - nearest) <= Fraction(int(expected['fps']), 1_000_000)
+    minimum = nearest if aligned else math.floor(span)
+    maximum = nearest if aligned else math.ceil(span)
+    require(minimum <= frames <= maximum,
+            'Output frame count differs: got %d, expected %d..%d' %
+            (frames, minimum, maximum))
     materials = {item['id']: item for bucket in expected.get('materials', {}).values()
                  if isinstance(bucket, list) for item in bucket if isinstance(item, dict)}
     expected_audio = any(
@@ -153,7 +163,7 @@ def run(build, out, ffmpeg=None, ffprobe=None, font=None, crf=18, preset='medium
             require(font is not None, 'Text rendering requires --font')
             font, font_record = verified_font(font, out)
         inputs, graph, video, audio, warnings = ffmpeg_graph.build(timeline, out, font)
-        (out / 'filter_complex.txt').write_text(graph, encoding='utf-8', newline='\n')
+        (out / 'filter_complex.txt').write_bytes(graph.encode('utf-8'))
         command = []
         for item in inputs:
             if item['still']:

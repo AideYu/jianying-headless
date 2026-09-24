@@ -38,7 +38,10 @@ Windows Jianying drafts are explicitly unsupported.
 Successful output retains render.mp4, result.json, the filter graph, FFprobe
 evidence and FFmpeg/full-decode logs. The result asserts duration, dimensions,
 frame rate, frame count, H.264/yuv420p output, complete decoding and an unchanged
-source build.
+source build. An exact frame-aligned timeline requires the exact frame count;
+only a genuinely fractional duration accepts its adjacent integer counts.
+The audio mix does not normalize against its silent timing bed, so an explicit
+volume such as 0.5 retains its requested gain.
 
 ## Verification
 
@@ -52,4 +55,5 @@ The GitHub workflow uses a normal pull_request event with read-only permissions.
 Its FFmpeg archive is selected by immutable release asset ID and verified by
 SHA-256. Evidence uses the repository's reviewed, redistributable public-media
 fixture; private drafts, account data, system fonts and source paths are not
-uploaded.
+uploaded. The public IG case also checks the rendered audio mean level against
+its requested 0.5 gain and retains a path-free `audio-gain.json` report.

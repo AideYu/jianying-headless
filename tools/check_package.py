@@ -66,6 +66,8 @@ def source_files():
         for name in names:
             path = Path(folder) / name
             relative = path.relative_to(ROOT).as_posix()
+            if relative == '.git':  # Git worktrees store metadata in a file.
+                continue
             if relative == LOCAL_CODEC:
                 continue
             if relative.startswith('.github/'):

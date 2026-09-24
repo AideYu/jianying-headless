@@ -129,7 +129,7 @@ def build(timeline, work, font=None):
             start, duration = int(target['start']), int(target['duration'])
             text_file = work / 'captions' / f'{text_count:04d}.txt'
             text_file.parent.mkdir(parents=True, exist_ok=True)
-            text_file.write_text(material['text'], encoding='utf-8', newline='\n')
+            text_file.write_bytes(material['text'].encode('utf-8'))
             output = f'vtext{text_count}'
             size = max(12, round(float(material.get('font_size', 6)) * height / 100))
             x = f'(w-text_w)/2+({float(segment.get("x", 0)):.6f})*w/2'
@@ -148,7 +148,8 @@ def build(timeline, work, font=None):
     if audio_parts:
         filters.append(f'anullsrc=r=48000:cl=stereo:d={sec(total)}[asilence]')
         filters.append('[asilence]' + ''.join(audio_parts) +
-                       f'amix=inputs={len(audio_parts) + 1}:duration=longest:dropout_transition=0,'
+                       f'amix=inputs={len(audio_parts) + 1}:duration=longest:'
+                       'dropout_transition=0:normalize=0,'
                        f'atrim=duration={sec(total)}[aout]')
         audio_label = '[aout]'
     filters.append(f'{current_video}trim=duration={sec(total)},setpts=PTS-STARTPTS[vout]')
