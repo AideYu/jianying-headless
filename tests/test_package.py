@@ -92,6 +92,7 @@ class PackagingTests(unittest.TestCase):
         with self.assertRaises(io.ApplyError):
             io._snapshot_file(link, 'fixture')
 
+    @unittest.skipIf(os.name == 'nt', 'macOS resource catalog relocation')
     def test_catalog_relocates_paths_without_changing_resource_identity(self):
         original = json.loads((ROOT / 'engine/native-resource-catalog.json').read_bytes())
         with patch.object(resources.Path, 'home', return_value=self.folder):

@@ -22,8 +22,10 @@ jobs:
           python-version: '3.12.10'
       - name: Source package regression
         run: python tools/check_package.py
-      - name: Portable regression suite
-        run: python -m unittest discover -s tests -v
+      - name: Portable package regression
+        run: python -m unittest discover -s tests -p test_package.py -v
+      - name: Public-media regression
+        run: python -m unittest discover -s tests -p test_public_media.py -v
 
   windows-ffmpeg:
     runs-on: windows-2022
