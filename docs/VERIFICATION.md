@@ -4,6 +4,8 @@
 
 本节记录候选补丁的验证结果：分支 `fix/export-path-and-container`，基于本轮开始时的上游 `main`
 （`fa1eaadb`），路径修复与容器判据分成两个可独立审核的提交，以候选 PR 形式提交、不自行合并。
+分支随后合入上游 `main`（`8b8984e`，含 Windows 导出后端），**两个修复提交本身未改动**，
+合并后重跑了下表全部检查。
 数据来自同一台 Mac、同一官方 11.5.0 安装、同一已验证 build 快照；
 不声称其他机器、其他剪映版本或全部路径形态。命令中的 `<repo>` 指仓库根目录。
 
@@ -95,10 +97,14 @@ python3 tools/verify_export_paths.py --build /absolute/path/to/verified/build --
   `test_sandbox_allows_only_owned_user_data_and_no_external_writes` 会失败（其 profile 只 deny `/Users`，
   兄弟目录读取被 `(allow default)` 放行）。修复前的 `fa1eaad` 同样如此（30 项 1 失败），
   **不是本次改动引入**；把 `JY_NATIVE_EXPORT_TEST_WORK` 指向 `$HOME` 下目录时 144 项与 34 项全部通过。
+- 分支已在两个修复提交之后合入上游 `main`（`8b8984e`）：合并无冲突，`engine/native_export.py` 的
+  哈希与 pin 仍为 `7b3470c04f91…`，单测 144 项与导出防护 34 项全部通过；`check_package.py` 的源码清单
+  条目由 92 增至 101（增加的是上游 Windows 相关文件），状态仍为 `source-checks-passed`。
 - 证据保留在忽略目录 `work/pathmatrix-before-fa1eaad/`、`work/pathmatrix-after-fix/`、
   `work/pubcase-{before,after}-*/`、`work/verify-export-paths-after-fix/`；不随仓库分发。
   候选分支 `fix/export-path-and-container` 以候选 PR 形式提交，不修改也不强推 #13 的分支，
-  不自行合并；本节数据均为本机实测。
+  不自行合并；本节数据均为本机实测。#13 已由原作者于 2026-09-24 关闭且未合并，
+  本分支未包含它的任何提交（本地也从未检出其分支）。
 
 ## 2026-09-22：11.5 兼容补交候选与后续诊断
 
