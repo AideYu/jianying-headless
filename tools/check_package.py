@@ -14,7 +14,8 @@ ROOT = Path(__file__).resolve().parent.parent
 LOCAL_DIRS = {'.git', 'work', '__pycache__', '.pytest_cache', '.venv'}
 LOCAL_CODEC = 'bridge/jy14_codec_hardened_11_4'
 SUFFIXES = {'.py', '.cpp', '.h', '.json', '.md', '.yaml', '.txt'}
-SPECIAL = {'.gitignore', 'NOTICE', 'LICENSE'}
+SPECIAL = {'.gitignore', '.gitattributes', 'NOTICE', 'LICENSE'}
+WORKFLOWS = {'.github/workflows/windows-ffmpeg.yaml'}
 # User-approved public IG case derivatives. Never turn this into a general
 # media extension allowance: exact bytes, size and path are release-reviewed.
 PUBLIC_MEDIA = {
@@ -65,8 +66,12 @@ def source_files():
         for name in names:
             path = Path(folder) / name
             relative = path.relative_to(ROOT).as_posix()
+            if relative == '.git':  # Git worktrees store metadata in a file.
+                continue
             if relative == LOCAL_CODEC:
                 continue
+            if relative.startswith('.github/'):
+                require(relative in WORKFLOWS, 'Unreviewed GitHub automation: ' + relative)
             require(path.is_file() and not path.is_symlink(), 'Nonregular source: ' + relative)
             require(path.suffix in SUFFIXES or name in SPECIAL or relative in PUBLIC_MEDIA,
                     'Unexpected source type: ' + relative)
@@ -85,6 +90,17 @@ def main():
         raw = path.read_bytes()
         require(b'\x00' not in raw, 'Binary content in source: ' + relative)
         content = raw.decode('utf-8-sig')
+        if relative in WORKFLOWS:
+            require('pull_request_target' not in content and 'pull_request:' in content,
+                    'Workflow must use normal pull_request execution')
+            require(re.search(r'(?m)^permissions:\s*\n\s+contents:\s*read\s*$', content),
+                    'Workflow permissions must be read-only')
+            require('secrets.' not in content and 'timeout-minutes:' in content
+                    and 'retention-days:' in content,
+                    'Workflow secret, timeout or retention policy is invalid')
+            for action in re.findall(r'(?m)^\s*-?\s*uses:\s*([^\s#]+)', content):
+                require(re.fullmatch(r'[^@]+@[0-9a-f]{40}', action),
+                        'Workflow action is not pinned to a reviewed commit: ' + action)
         for label, pattern in PATTERNS.items():
             require(not pattern.search(content), label + ' in ' + relative)
         if path.suffix == '.py':
